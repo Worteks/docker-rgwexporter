@@ -1,0 +1,210 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: radosgw-exported
+  template: radosgw-exported-ephemeral
+metadata:
+  annotations:
+    description: Ceph RadosGW - ephemeral
+      see https://github.com/Worteks/docker-rgwexporter
+    iconClass: icon-openshift
+    openshift.io/display-name: Ceph RadosGW Exported
+    tags: radosgw-exported
+  name: radosgw-exported-ephemeral
+objects:
+- kind: DeploymentConfig
+  apiVersion: v1
+  metadata:
+    name: radosgw-${FRONTNAME}
+  spec:
+    replicas: 1
+    selector:
+      name: radosgw-${FRONTNAME}
+    strategy:
+      type: Rolling
+    template:
+      metadata:
+        labels:
+          name: radosgw-${FRONTNAME}
+      spec:
+        dnsPolicy: ClusterFirst
+        hostAliases:
+        - ip: "127.0.0.1"
+          hostnames:
+          - "radosgw"
+        containers:
+        - capabilities: {}
+          env:
+          - name: CEPH_DAEMON
+            value: rgw
+          - name: KEYRING_NAME
+            value: ${RADOSGW_KEYRING_NAME}
+          - name: RGW_NAME
+            value: radosgw
+          - name: RGW_CIVETWEB_PORT
+            value: "8080"
+          image: ' '
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            initialDelaySeconds: 30
+            timeoutSeconds: 1
+            tcpSocket:
+              port: 8080
+          name: radosgw
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "${RADOSGW_CPU_LIMIT}"
+              memory: "${RADOSGW_MEMORY_LIMIT}"
+          terminationMessagePath: /dev/termination-log
+          volumeMounts:
+          - name: conf
+            mountPath: /var/lib/ceph/radosgw/${CEPH_CLUSTER_NAME}-rgw.radosgw/keyring
+            subPath: ${CEPH_CLUSTER_NAME}.client.radosgw.keyring
+          - name: conf
+            mountPath: /etc/ceph
+        - capabilities: {}
+          env:
+          - name: RADOSGW_HOST
+            value: radosgw
+          - name: RADOSGW_PORT
+            value: "8080"
+          - name: ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: radosgw-${FRONTNAME}
+                key: s3-usage-access-key
+          - name: SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: radosgw-${FRONTNAME}
+                key: s3-usage-secret-key
+          image: ' '
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            tcpSocket:
+              port: 9113
+            timeoutSeconds: 1
+          name: exporter
+          ports:
+          - containerPort: 9113
+            protocol: TCP
+          resources:
+            limits:
+              cpu: "${EXPORTER_CPU_LIMIT}"
+              memory: "${EXPORTER_MEMORY_LIMIT}"
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        restartPolicy: Always
+        volumes:
+        - name: conf
+          configMap:
+            defaultMode: 420
+            name: radosgw-${FRONTNAME}-conf
+    triggers:
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        containerNames:
+        - radosgw
+        from:
+          kind: ImageStreamTag
+          name: ${RADOSGW_IMAGESTREAM_TAG}
+        lastTriggeredImage: ''
+    - type: ImageChange
+      imageChangeParams:
+        automatic: true
+        containerNames:
+        - exporter-${FRONTNAME}
+        from:
+          kind: ImageStreamTag
+          name: radosgw-exporter-${RADOSGW_EXPORTER_IMAGE_FRONTNAME}:${RADOSGW_EXPORTER_IMAGE_TAG}
+        lastTriggeredImage: ''
+    - type: ConfigChange
+- kind: Service
+  apiVersion: v1
+  metadata:
+    annotations:
+      template.openshift.io/expose-uri: http://{.spec.clusterIP}:{.spec.ports[?(.name=="http")].port}
+    name: radosgw-${FRONTNAME}
+  spec:
+    ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 0
+    selector:
+      name: radosgw-${FRONTNAME}
+    type: ClusterIP
+- kind: Service
+  apiVersion: v1
+  metadata:
+    annotations:
+      description: Exposes RadosGW Prometheus Exporter
+    labels:
+      ${PROMETHEUS_SERVICE_SELECTOR}: ${PROMETHEUS_SERVICE_MATCH}
+    name: radosgw-exporter-${FRONTNAME}
+  spec:
+    ports:
+    - name: exporter
+      port: 9113
+      protocol: TCP
+      targetPort: 9113
+    selector:
+      name: radosgw-${FRONTNAME}
+    type: ClusterIP
+parameters:
+- name: CEPH_CLUSTER_NAME
+  description: Ceph Cluster Name
+  displayName: Ceph Cluster Name
+  value: ceph
+- name: EXPORTER_CPU_LIMIT
+  value: 50m
+  description: Maximum amount of CPU a RadosGW Exporter container can use
+  displayName: RadosGW CPU Limit
+  required: true
+- name: EXPORTER_MEMORY_LIMIT
+  description: Maximum amount of memory a RadosGW Exporter container can use
+  displayName: RadosGW Memory Limit
+  value: 64Mi
+- name: FRONTNAME
+  description: The name identifier assigned to objects defined in this template
+  displayName: Name
+  required: true
+  value: demo
+- name: PROMETHEUS_SERVICE_SELECTOR
+  value: prometheus
+- name: PROMETHEUS_SERVICE_MATCH
+  value: scrape-me
+- name: RADOSGW_CPU_LIMIT
+  description: Maximum amount of CPU a RadosGW container can use
+  displayName: RadosGW CPU Limit
+  required: true
+  value: 200m
+- name: RADOSGW_IMAGESTREAM_TAG
+  description: RadosGateway ImageStream Tag
+  displayName: RGW ImageStream Tag
+  required: true
+  value: rados-wsweet:master
+- name: RADOSGW_EXPORTER_IMAGE_FRONTNAME
+  description: The name assigned to ImageStream object defined in corresponding template
+  displayName: Name
+  required: true
+  value: wsweet
+- name: RADOSGW_EXPORTER_IMAGE_TAG
+  description: The ImageStreamTag we should pull images from
+  displayName: Tag
+  required: true
+  value: master
+- name: RADOSGW_MEMORY_LIMIT
+  description: Maximum amount of memory a RadosGW container can use
+  displayName: RadosGW Memory Limit
+  required: true
+  value: 512Mi

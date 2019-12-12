@@ -1,0 +1,228 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: rgwexporter
+  template: rgwexporter-jenkins-pipeline
+metadata:
+  annotations:
+    description: RadosGW Exporter - Jenkinsfile
+      see https://github.com/Worteks/docker-rgwexporter
+    iconClass: icon-openshift
+    openshift.io/display-name: RadosGW Exporter CI
+    tags: rgwexporter
+  name: rgwexporter-jenkins-pipeline
+objects:
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    annotations:
+      description: Builds Wsweet RadosGW Exporter Images
+    name: rgwexporter-jenkins-pipeline
+  spec:
+    strategy:
+      jenkinsPipelineStrategy:
+        jenkinsfile: |-
+          def gitCommitMsg = ''
+          def templateMark = 'rgwexporter-jenkins-ci'
+          def templateSel  = 'jenkins-ci-mark'
+          pipeline {
+              agent {
+                  node { label 'maven' }
+              }
+              options { timeout(time: 65, unit: 'MINUTES') }
+              parameters {
+                  string(defaultValue: '3', description: 'Max Retry', name: 'jobMaxRetry')
+                  string(defaultValue: '1', description: 'Retry Count', name: 'jobRetryCount')
+                  string(defaultValue: 'master', description: 'RadosGW Exporter Docker Image - Source Git Branch', name: 'rgwexporterBranch')
+                  string(defaultValue: 'master', description: 'RadosGW Exporter Docker Image - Source Git Hash', name: 'rgwexporterHash')
+                  string(defaultValue: '${GIT_SOURCE_HOST}/Worteks/docker-rgwexporter.git', description: 'RadosGW Exporter Docker Image - Source Git Repository', name: 'rgwexporterRepo')
+              }
+              stages {
+                  stage('pre-cleanup') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      echo "Using project: ${openshift.project()}"
+                                      echo "cleaning up previous assets for rgwexporter-wsweet-${params.rgwexporterHash}"
+                                      openshift.selector("buildconfigs", [ "${templateSel}": "${templateMark}-${params.rgwexporterHash}" ]).delete()
+                                      openshift.selector("deploymentconfigs", [ "${templateSel}": "${templateMark}-${params.rgwexporterHash}" ]).delete()
+                                      openshift.selector("configmaps", [ "${templateSel}": "${templateMark}-${params.rgwexporterHash}" ]).delete()
+                                      openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.rgwexporterHash}" ]).delete()
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('create') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      def namespace = "${openshift.project()}"
+                                      try {
+                                          timeout(10) {
+                                              def cloneProto = "http"
+                                              def created
+                                              def objectsFromTemplate
+                                              def privateRepo = false
+                                              def repoHost = params.rgwexporterRepo.split('/')[0]
+                                              def templatePath = "/tmp/workspace/${namespace}/${namespace}-rgwexporter-jenkins-pipeline/tmprgwexporter${params.rgwexporterBranch}/openshift"
+                                              sh "git config --global http.sslVerify false"
+                                              sh "rm -fr tmprgwexporter${params.rgwexporterBranch}; mkdir -p tmprgwexporter${params.rgwexporterBranch}"
+                                              dir ("tmprgwexporter${params.rgwexporterBranch}") {
+                                                  try {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          cloneProto = "https"
+                                                          privateRepo = true
+                                                          echo "cloning ${params.rgwexporterRepo} over https, using ${repoHost} token"
+                                                          try { git([ branch: "${params.rgwexporterBranch}", url: "https://${GIT_TOKEN}@${params.rgwexporterRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.rgwexporterRepo}#${params.rgwexporterBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      }
+                                                  } catch(e) {
+                                                      if (privateRepo != true) {
+                                                          echo "caught ${e} - assuming no credentials required"
+                                                          echo "cloning ${params.rgwexporterRepo} over http"
+                                                          try { git([ branch: "${params.rgwexporterBranch}", url: "http://${params.rgwexporterRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.rgwexporterRepo}#${params.rgwexporterBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      } else { throw e }
+                                                  }
+                                                  try {
+                                                      gitCommitMsg = sh(returnStdout: true, script: "git log -n 1").trim()
+                                                  } catch(e) { echo "In non-critical catch block resolving commit message - ${e}" }
+                                              }
+                                              try { sh "test -d ${templatePath}" }
+                                              catch (e) {
+                                                  echo "Could not find ./openshift in ${params.rgwexporterRepo}#${params.rgwexporterBranch}"
+                                                  throw e
+                                              }
+                                              echo "Processing RGWExporter:${params.rgwexporterHash}, from ${repoHost}, tagging to ${params.rgwexporterBranch}"
+                                              try {
+                                                  echo " == Creating ImageStream =="
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/imagestream.yaml", '-p', "FRONTNAME=wsweet")
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating ImageStream - ${e}" }
+                                              echo " == Creating BuildConfigs =="
+                                              if (privateRepo) {
+                                                  withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                      objectsFromTemplate = openshift.process("-f", "${templatePath}/build-with-secret.yaml", '-p', "RADOSGW_EXPORTER_REPOSITORY_REF=${params.rgwexporterHash}",
+                                                          '-p', "FRONTNAME=wsweet", '-p', "GIT_DEPLOYMENT_TOKEN=${GIT_TOKEN}", '-p', "RADOSGW_EXPORTER_REPOSITORY_URL=${cloneProto}://${params.rgwexporterRepo}")
+                                                  }
+                                              } else {
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/build.yaml", '-p', "FRONTNAME=wsweet",
+                                                      '-p', "RADOSGW_EXPORTER_REPOSITORY_REF=${params.rgwexporterHash}", '-p', "RADOSGW_EXPORTER_REPOSITORY_URL=${cloneProto}://${params.rgwexporterRepo}")
+                                              }
+                                              echo "The template will create ${objectsFromTemplate.size()} objects"
+                                              for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.rgwexporterHash}" }
+                                              created = openshift.apply(objectsFromTemplate)
+                                              created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while creating resources - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('build') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(45) {
+                                              echo "watching rgwexporter-wsweet-${params.rgwexporterHash} docker image build"
+                                              def builds = openshift.selector("bc", [ name: "rgwexporter-wsweet-${params.rgwexporterHash}" ]).related('builds')
+                                              builds.untilEach(1) { return (it.object().status.phase == "Complete") }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while building Docker image - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('tag') {
+                      steps {
+                          script {
+                              if ("${params.rgwexporterBranch}" == "${params.rgwexporterHash}") { echo "skipping tag - source matches target" }
+                              else {
+                                  openshift.withCluster() {
+                                      openshift.withProject() {
+                                          try {
+                                              timeout(5) {
+                                                  def namespace = "${openshift.project()}"
+                                                  retry(3) {
+                                                      sh """
+                                                      oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                      oc tag -n ${namespace} rgwexporter-wsweet:${params.rgwexporterHash} rgwexporter-wsweet:${params.rgwexporterBranch}
+                                                      """
+                                                  }
+                                              }
+                                          } catch(e) {
+                                              echo "In catch block while tagging RadosGW Exporter image - ${e}"
+                                              throw e
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              post {
+                  always {
+                      script {
+                          openshift.withCluster() {
+                              openshift.withProject() {
+                                  def namespace   = "${openshift.project()}"
+                                  def postJobName = "${namespace}/${namespace}-post-triggers-jenkins-pipeline"
+                                  currentBuild.description = """
+                                  ${params.rgwexporterRepo} ${params.rgwexporterBranch} (try ${params.jobRetryCount}/${params.jobMaxRetry})
+                                  ${gitCommitMsg}
+                                  """.stripIndent()
+                                  echo "cleaning up assets for rgwexporter-wsweet-${params.rgwexporterHash}"
+                                  sh "rm -fr /tmp/workspace/${namespace}/${namespace}-rgwexporter-jenkins-pipeline/tmprgwexporter${params.rgwexporterBranch}"
+                                  openshift.selector("buildconfigs", [ "${templateSel}": "${templateMark}-${params.rgwexporterHash}" ]).delete()
+                                  openshift.selector("deploymentconfigs", [ "${templateSel}": "${templateMark}-${params.rgwexporterHash}" ]).delete()
+                                  openshift.selector("configmaps", [ "${templateSel}": "${templateMark}-${params.rgwexporterHash}" ]).delete()
+                                  openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.rgwexporterHash}" ]).delete()
+                                  def jobParams = [
+                                          [$class: 'StringParameterValue', name: "jobMaxRetry", value: params.jobMaxRetry],
+                                          [$class: 'StringParameterValue', name: "jobRetryCount", value: params.jobRetryCount],
+                                          [$class: 'StringParameterValue', name: "jobStatus", value: currentBuild.currentResult],
+                                          [$class: 'StringParameterValue', name: "sourceBranch", value: params.rgwexporterBranch],
+                                          [$class: 'StringParameterValue', name: "sourceComponent", value: "rgwexporter"],
+                                          [$class: 'StringParameterValue', name: "sourceRef", value: params.rgwexporterHash],
+                                          [$class: 'StringParameterValue', name: "sourceRepo", value: params.rgwexporterRepo]
+                                      ]
+                                  try { build job: postJobName, parameters: jobParams, propagate: false, wait: false }
+                                  catch(e) { echo "caught ${e} starting Job post-process" }
+                              }
+                          }
+                      }
+                  }
+                  changed { echo "changed?" }
+                  failure { echo "Build failed (${params.jobRetryCount} out of ${params.jobMaxRetry})" }
+                  success { echo "success!" }
+                  unstable { echo "unstable?" }
+              }
+          }
+      type: JenkinsPipeline
+parameters:
+- name: GIT_SOURCE_HOST
+  description: Git FQDN we would build images from
+  displayName: Git
+  value: github.com
